@@ -1,0 +1,8 @@
+[Unit]
+Description=Gate between MQTT and MegaD devices
+
+[Service]
+ExecStart=/usr/bin/env python /home/rs/megad-mqtt-gw/megad-mqtt-gw.py
+
+[Install]
+WantedBy=multi-user.target
