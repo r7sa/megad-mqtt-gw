@@ -68,11 +68,12 @@ light:
     payload_on: "1"
     payload_off: "0"
     optimistic: false
-  - platform: mqtt
+  - platform: mqtt_template
     name: "Диммируемый канал"
     command_topic: "/devices/megad_192.168.1.114/controls/p10/on"
     state_topic: "/devices/megad_192.168.1.114/controls/p10/value"
-    payload_on: "255"
-    payload_off: "0"
-    optimistic: false
+    command_on_template: "{%- if brightness is defined -%}{{ brightness | d }}{%- else -%}255{%- endif -%}"
+    command_off_template: "0"
+    state_template: "{%- if value| float > 0 -%}on{%- else -%}off{%- endif -%}"  # must return `on` or `off`
+    brightness_template: "{{ value }}"
 ```
