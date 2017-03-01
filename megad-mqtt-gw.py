@@ -117,8 +117,8 @@ class MegaDDevice(object):
                         self.ports[p_name]['value'] = 1
                         updated.append(p_name)
                 elif val.isnumeric():
-                    if 'value' not in self.ports[p_name] or self.ports[p_name]['value'] != float(val):
-                        self.ports[p_name]['value'] = float(val)
+                    if 'value' not in self.ports[p_name] or self.ports[p_name]['value'] != int(val):
+                        self.ports[p_name]['value'] = int(val)
                         updated.append(p_name)
                 else:
                     logger.warning('Can\'t state of port. MegaD ID: ' + self.mega_id + '. Port: ' + str(idx) +
@@ -176,7 +176,7 @@ class MegaDDevicesSet(object):
         cf_mqtt = cfg['mqtt']
         self.devices_mqtt_topic = defaultdict(lambda: defaultdict(lambda: MegaDDevicesSet.MQTTPortDesc()))
         self.devices_mqtt_name_topic = defaultdict(lambda: [])
-        for dev in self.devices:
+        for dev_id, dev in self.devices.items():
             self.devices_mqtt_name_topic[dev.device_id] = cf_mqtt['device_name_topic'].format(device_id=dev.device_id)
             for port, desc in dev.get_ports().items():
                 port_prefix = cf_mqtt['device_port_topic'].format(device_id=dev.device_id, port=port)
@@ -199,38 +199,55 @@ class MegaDDevicesSet(object):
         self.http_server = http_server
         self.mqtt_client = mqtt_client
 
+    async def on_http_message_postprocess(self, address):
+        megad_id = 'megad_' + str(address)
+        try:
+            dev = self.devices.get(megad_id, None)
+            if dev is None:
+                return
+            updated_ports = await dev.fetch_ports_state()
+            for port in updated_ports:
+                v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
+                for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                    await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
+        except Exception as e:
+            logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
+
     async def on_http_message(self, address, parameters):
         megad_id = 'megad_' + str(address)
         port = 'p' + parameters.get('pt', None)
         try:
             dev = self.devices.get(megad_id, None)
             if dev is None:
-                return
+                return ''
             port_data = dev.get_ports().get(port, None)
             if port_data is None:
-                return
+                return ''
             if port_data['pty'] == '0':
-                port_data['value'] = parameters.get('m', None)
+                port_data['value'] = parameters.get('m', 1)
                 v_keyword = {'device_id': dev.device_id, **port_data}
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
+                return port_data.get('ecmd', '')
             else:
                 pass   # TODO:
         except Exception as e:
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
+        return ''
 
-    async def on_mqtt_connect(self, mqtt_client):
+    async def on_mqtt_connect(self):
         self.mqtt_value_topic = {}
-        for dev in self.devices:
-            mqtt_client.publish(self.devices_mqtt_name_topic[dev.device_id], dev.device_name, 0, True)
+        for dev_id, dev in self.devices.items():
+            await dev.fetch_ports_state()
+            await self.mqtt_client.async_publish(self.devices_mqtt_name_topic[dev.device_id], dev.device_name, 0, True)
             for port, port_data in dev.get_ports().items():
                 v_keyword = {'device_id': dev.device_id, **port_data}
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].constant:
-                    await self.mqtt_client.publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
+                    await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
-                    await self.mqtt_client.publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
+                    await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
                 for t in self.devices_mqtt_topic[dev.device_id][port].subscribe:
-                    await mqtt_client.async_subscribe(t)
+                    await self.mqtt_client.async_subscribe(t)
 
     async def on_mqtt_message(self, topic, payload):
         try:
@@ -326,7 +343,7 @@ class MQTT(object):
 
         return self.loop.run_in_executor(None, stop)
 
-    async def async_subscribe(self, topic, qos):
+    async def async_subscribe(self, topic, qos=DEFAULT_QOS):
         with (await self._paho_lock):
             result, mid = await self.loop.run_in_executor(None, self._mqttc.subscribe, topic, qos)
             await asyncio.sleep(0, loop=self.loop)
@@ -388,6 +405,10 @@ def _raise_on_error(result):
 ###############################################################################
 
 
+async def handler_http_postprocess(host):
+    await devices.on_http_message_postprocess(host)
+
+
 async def handler_http(request):
     if request.rel_url.path != '/megad':
         return aiohttp.web.Response(text="ERROR: Incorrect path")
@@ -395,8 +416,16 @@ async def handler_http(request):
     if peername is None:
         return aiohttp.web.Response(text="ERROR: Internal error - unknown remote address of peer")
     host, port = peername
-    devices.on_http_message(host, request.rel_url.query)
-    return aiohttp.web.Response(text="OK HTTP")
+    command = await devices.on_http_message(host, request.rel_url.query)
+
+    request.transport._loop.create_task(handler_http_postprocess(host))
+
+    # hack to send headers and body in one packet as required by MegaD-328
+    request._writer.set_tcp_cork(True)
+    request._writer.set_tcp_nodelay(False)
+    response = aiohttp.web.Response(text=command)
+    response.force_close()
+    return response
 
 
 ###############################################################################
@@ -465,7 +494,7 @@ def main_configure():
 
 
 async def async_main(loop, conf_http, conf_mqtt):
-    server_http = aiohttp.web.Server(handler_http)
+    server_http = aiohttp.web.Server(handler_http, loop=loop)
     await loop.create_server(server_http,
                              conf_http.get('address', '0.0.0.0'),
                              conf_http.get('port', '19780'))
