@@ -40,6 +40,16 @@
 доступным 24х7.
 
 
+## Установка
+
+  - sudo pip install git+https://github.com/repalov/megad-mqtt-gw/
+  - Отредактировать /etc/megad-mqtt-gw.conf
+  - sudo systemctl daemon-reload
+  - sudo systemctl enable megad-mqtt-gw
+  - sudo systemctl start megad-mqtt-gw
+  - sudo systemctl status megad-mqtt-gw
+
+
 ## Пример конфигурации
 
 Для связывания с home-assistant или WirenBoard использую следующую конфигурацию.
@@ -100,9 +110,26 @@ light:
   - **--debug** - включает отладочный режим. В журнал и на консоль выводится расширенная информация.
 
 
-## Автозапуск с помощью systemd
+## Ручная установка
 
-  - Скопировать *megad-mqtt-gw.service* в каталог */lib/systemd/system/*.
+### Установка зависимостей
+  - sudo pip install aiohttp
+  - sudo pip install lxml
+  - sudo pip install paho-mqtt
+
+### Получение исходников
+  git clone https://github.com/repalov/megad-mqtt-gw.git
+  cd megad-mqtt-gw
+
+### Установка исполнимого файла
+  sudo cp megad-mqtt-gw.py /usr/bin
+
+### Установка конфигурационного файла
+  - sudo cp megad-mqtt-gw.conf /etc
+  - Отредактировать  /etc/megad-mqtt-gw.conf
+
+### Автозапуск с помощью systemd
+  - sudo cp megad-mqtt-gw.service /lib/systemd/system/
   - Исправить в */lib/systemd/system/megad-mqtt-gw.service* все пути
     на верные и абсолютные.
   - Включить автозапуск: ```sudo systemctl enable megad-mqtt-gw.service```
