@@ -1,23 +1,22 @@
 #!/usr/bin/env python
 
-import asyncio
-import signal
-import time
-import socket
-import logging
-import logging.handlers
-import argparse
-import os.path
-import lxml.etree
-import urllib.request
-import re
 import aiohttp
 import aiohttp.web
-import json
-import sys
-import enum
-import paho.mqtt.client as mqtt
+import argparse
+import asyncio
 from collections import defaultdict
+import enum
+import json
+import logging
+import logging.handlers
+import lxml.etree
+import os.path
+import paho.mqtt.client as mqtt
+import re
+import signal
+import socket
+import sys
+import urllib.request
 
 
 devices = None
@@ -211,6 +210,18 @@ class MegaDDevicesSet(object):
         self.http_server = http_server
         self.mqtt_client = mqtt_client
 
+    async def on_http_pool(self):
+        try:
+            for megad_id, dev in self.devices.items():
+                updated_ports = await dev.fetch_ports_state()
+                for port in updated_ports:
+                    v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
+                    for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                        logger.debug('HTTP pool: Sending MQTT message to topic {}'.format(t))
+                        await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
+        except Exception as e:
+            logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
+
     async def on_http_message_postprocess(self, address):
         megad_id = 'megad_' + str(address)
         try:
@@ -221,6 +232,7 @@ class MegaDDevicesSet(object):
             for port in updated_ports:
                 v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                    logger.debug('SHTTP postprocess: ending MQTT message to topic {}'.format(t))
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
         except Exception as e:
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
@@ -241,7 +253,7 @@ class MegaDDevicesSet(object):
                 port_data['value'] = parameters.get('m', 1)
                 v_keyword = {'device_id': dev.device_id, **port_data}
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
-                    logger.debug('Sending MQTT message to topic {}'.format(t))
+                    logger.debug('HTTP message: Sending MQTT message to topic {}'.format(t))
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
                 result = ''
                 if dev.response_mode == MegaDDevice.ResponseMode.DEVICE:
@@ -328,6 +340,7 @@ class MQTT(object):
         if tls_insecure is not None:
             self._mqttc.tls_insecure_set(tls_insecure)
         self._mqttc.on_connect = self._mqtt_on_connect
+        self._mqttc.on_disconnect = self._mqtt_on_disconnect
         self._mqttc.on_message = self._mqtt_on_message
 
     async def async_publish(self, topic, payload, qos=DEFAULT_QOS, retain=DEFAULT_RETAIN):
@@ -388,7 +401,11 @@ class MQTT(object):
             logger.error('Unable to connect to the MQTT broker: %s', mqtt.connack_string(result_code))
             self._mqttc.disconnect()
             return
+        logger.debug("Connected from MQTT.")
         self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_connect)
+
+    def _mqtt_on_disconnect(self, _mqttc, _userdata, result_code):
+        logger.debug("Disconnected from MQTT. Result code: {} ({}) ".format(mqtt.error_string(result_code), result_code))
 
     def _mqtt_on_message(self, _mqttc, _userdata, msg):
         self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_message, msg.topic, msg.payload, msg.qos)
@@ -449,11 +466,9 @@ def main_configure():
     global devices
     global logger
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
     parser = argparse.ArgumentParser(description='WirenBoard driver for MegaDevices (ab-log.ru).')
-    parser.add_argument('--config', default='megad-mqtt-gw.json', help='name of configuration file')
-    parser.add_argument('--log', default='%s/log/megad-mqtt-gw.log' % script_dir, help='name of log file')
+    parser.add_argument('--config', default='/etc/megad-mqtt-gw.conf', help='name of configuration file')
+    parser.add_argument('--log', default='/var/log/megad-mqtt-gw.log', help='name of log file')
     parser.add_argument('--debug', action='store_true', default=False, help='output more information to log and console')
     args = parser.parse_args()
 
@@ -492,11 +507,24 @@ def main_configure():
     return cfg
 
 
+def async_pooling_cb(loop, interval):
+    async def pool():
+        global devices
+        await devices.on_http_pool()
+        if loop.is_running():
+            loop.call_later(interval, async_pooling_cb, loop, interval)
+
+    loop.create_task(pool())
+
+
 async def async_main(loop, conf_http, conf_mqtt):
+    # Create MegaD connector (HTTP server)
     server_http = aiohttp.web.Server(handler_http, loop=loop)
     await loop.create_server(server_http,
                              conf_http.get('address', '0.0.0.0'),
                              conf_http.get('port', '19780'))
+
+    # Create MQTT connector
     server_mqtt = MQTT(loop,
                        broker=conf_mqtt.get('address', '127.0.0.1'), port=conf_mqtt.get('port', DEFAULT_PORT),
                        client_id=conf_mqtt.get('client_id', 'megad-mqtt-gw'), keepalive=DEFAULT_KEEPALIVE,
@@ -508,11 +536,19 @@ async def async_main(loop, conf_http, conf_mqtt):
     await server_mqtt.async_connect()
     await server_mqtt.async_start()
 
+    # Create timer for MegaD devices periodic pooling
+    pool_interval = conf_http.get('pool', 0)
+    if pool_interval > 0:
+        loop.call_later(pool_interval, async_pooling_cb, loop, pool_interval)
+
+    # Postinitialisation
     devices.set_servers(server_http, server_mqtt)
 
+    # Main application loop
     while loop.is_running():
         await asyncio.sleep(100 * 3600)
 
+    # Finalisation
     await server_mqtt.async_stop()
 
 

@@ -1,0 +1,3 @@
+include megad-mqtt-gw.*
+include README.md
+include LICENSE
