@@ -132,6 +132,7 @@ light:
   - sudo cp megad-mqtt-gw.service /lib/systemd/system/
   - Исправить в */lib/systemd/system/megad-mqtt-gw.service* все пути
     на верные и абсолютные.
+  - sudo systemctl daemon-reload
   - Включить автозапуск: ```sudo systemctl enable megad-mqtt-gw.service```
   - Запустить: ```sudo systemctl start megad-mqtt-gw.service```
   - Проверить состояние: ```sudo systemctl status megad-mqtt-gw.service```
