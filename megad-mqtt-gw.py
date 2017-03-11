@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import asyncio
 import signal
 import time
@@ -13,6 +15,7 @@ import aiohttp
 import aiohttp.web
 import json
 import sys
+import enum
 import paho.mqtt.client as mqtt
 from collections import defaultdict
 
@@ -22,7 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class MegaDDevice(object):
-    device_room = None
+    class ResponseMode(enum.Enum):
+        EMPTY = 0
+        DEVICE = 1
+
+    response_mode_by_str = {
+        'empty': ResponseMode.EMPTY,
+        'blank': ResponseMode.EMPTY,
+        'device': ResponseMode.DEVICE
+    }
 
     def _parse_port_html(self, response_body):
         if False:
@@ -88,6 +99,7 @@ class MegaDDevice(object):
     def __init__(self, cfg):
         self.address = cfg['address']
         self.password = cfg['password']
+        self.response_mode = MegaDDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
         self.device_base_url = 'http://' + self.address + '/' + self.password + '/'
         self.mega_id, self.ports = self._query_device(self.address, self.password)
         self.device_id = 'megad_' + self.mega_id
@@ -214,6 +226,8 @@ class MegaDDevicesSet(object):
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
     async def on_http_message(self, address, parameters):
+        logger.debug('HTTP message from {} with parameters {}'.format(address, parameters))
+
         megad_id = 'megad_' + str(address)
         port = 'p' + parameters.get('pt', None)
         try:
@@ -227,8 +241,13 @@ class MegaDDevicesSet(object):
                 port_data['value'] = parameters.get('m', 1)
                 v_keyword = {'device_id': dev.device_id, **port_data}
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                    logger.debug('Sending MQTT message to topic {}'.format(t))
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
-                return port_data.get('ecmd', '')
+                result = ''
+                if dev.response_mode == MegaDDevice.ResponseMode.DEVICE:
+                    result = port_data.get('ecmd', '')
+                logger.debug('HTTP response is {}'.format(result))
+                return result
             else:
                 pass   # TODO:
         except Exception as e:
@@ -259,12 +278,14 @@ class MegaDDevicesSet(object):
                 if dev is None:
                     return
 
+                logger.debug('MQTT inbound message for {} with parameters {}. Result is {}'.format(device_id, control, payload.decode('utf-8')))
                 await dev.send_message(control, payload.decode('utf-8'))
 
                 updated_ports = await dev.fetch_ports_state()
                 for port in updated_ports:
                     v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
                     for t, v in self.devices_mqtt_topic[device_id][port].mutable:
+                        logger.debug('MQTT outbound message for topic {}'.format(t))
                         await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
         except Exception as e:
             logger.error('Exception on MQTT message processing. Exception detail: ' + str(e))
@@ -307,7 +328,6 @@ class MQTT(object):
         if tls_insecure is not None:
             self._mqttc.tls_insecure_set(tls_insecure)
         self._mqttc.on_connect = self._mqtt_on_connect
-        self._mqttc.on_disconnect = self._mqtt_on_disconnect
         self._mqttc.on_message = self._mqtt_on_message
 
     async def async_publish(self, topic, payload, qos=DEFAULT_QOS, retain=DEFAULT_RETAIN):
@@ -373,27 +393,6 @@ class MQTT(object):
     def _mqtt_on_message(self, _mqttc, _userdata, msg):
         self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_message, msg.topic, msg.payload, msg.qos)
 
-    def _mqtt_on_disconnect(self, _mqttc, _userdata, result_code):
-        # When disconnected because of calling disconnect()
-        if result_code == 0:
-            return
-
-        # TODO: check that we must not reach this point (?) and remove rest of code or whole callback
-        tries = 0
-        while True:
-            try:
-                if self._mqttc.reconnect() == 0:
-                    logger.info("Successfully reconnected to the MQTT server")
-                    break
-            except socket.error:
-                pass
-
-            wait_time = min(2**tries, MAX_RECONNECT_WAIT)
-            logger.warning("Disconnected from MQTT (%s). Trying to reconnect in %s s", result_code, wait_time)
-            # It is ok to sleep here as we are in the MQTT thread.
-            time.sleep(wait_time)
-            tries += 1
-
 
 def _raise_on_error(result):
     if result != 0:
@@ -453,7 +452,7 @@ def main_configure():
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     parser = argparse.ArgumentParser(description='WirenBoard driver for MegaDevices (ab-log.ru).')
-    parser.add_argument('--config', default='megad-mqtt-gw.json', help='name of updated configuration file')
+    parser.add_argument('--config', default='megad-mqtt-gw.json', help='name of configuration file')
     parser.add_argument('--log', default='%s/log/megad-mqtt-gw.log' % script_dir, help='name of log file')
     parser.add_argument('--debug', action='store_true', default=False, help='output more information to log and console')
     args = parser.parse_args()
