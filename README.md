@@ -1,3 +1,5 @@
+[![Updates](https://pyup.io/repos/github/repalov/megad-mqtt-gw/shield.svg)](https://pyup.io/repos/github/repalov/megad-mqtt-gw/)
+
 # megad-mqtt-gw
 
 Приложение является гейтом между мегами MQTT. 
