@@ -120,11 +120,11 @@ light:
   - sudo pip install paho-mqtt
 
 ### Получение исходников
-  git clone https://github.com/repalov/megad-mqtt-gw.git
-  cd megad-mqtt-gw
+  - git clone https://github.com/repalov/megad-mqtt-gw.git
+  - cd megad-mqtt-gw
 
 ### Установка исполнимого файла
-  sudo cp megad-mqtt-gw.py /usr/bin
+  - sudo cp megad-mqtt-gw.py /usr/bin
 
 ### Установка конфигурационного файла
   - sudo cp megad-mqtt-gw.conf /etc
