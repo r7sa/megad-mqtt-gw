@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 import aiohttp
 import aiohttp.web
 import argparse
@@ -17,6 +16,7 @@ import signal
 import socket
 import sys
 import urllib.request
+
 
 devices = None
 logger = logging.getLogger(__name__)
