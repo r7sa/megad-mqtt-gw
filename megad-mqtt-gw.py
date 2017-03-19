@@ -80,18 +80,37 @@ class MegaDDevice(object):
         m = re.search(r'<input[^>]+name=mdid\s[^>]+value="([^"]*)">', megaid_html)
         megaid = m.group(1) if m and len(m.group(1)) > 0 else device_address
 
-        # query ports description
-        ports_html = urllib.request.urlopen('http://' + device_address + '/' + device_password).read().decode()
+        megaver_html = urllib.request.urlopen('http://' + device_address + '/' + device_password + '/', timeout=10).\
+            read().decode()
+        megaver = 328
+        if 'MegaD-2561' in megaver_html:
+            megaver = 2561
+
         ports = {}
-        for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
-            port_html = urllib.request.urlopen('http://' + device_address + it.group(1)).read().decode()
-            port_props = self._parse_port_html(port_html)
-            port_props['name'] = it.group(2)
-            if 'pn' in port_props:
-                ports['p' + port_props['pn']] = port_props
-            else:
-                logger.warning('incorrect or unsupported port description received from address http://' +
-                      device_address + it.group(1))
+        if megaver == 328:
+            ports_html = urllib.request.urlopen('http://' + device_address + '/' + device_password).read().decode()
+            for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
+                port_html = urllib.request.urlopen('http://' + device_address + it.group(1)).read().decode()
+                port_props = self._parse_port_html(port_html)
+                port_props['name'] = it.group(2)
+                if 'pn' in port_props:
+                    ports['p' + port_props['pn']] = port_props
+                else:
+                    logger.warning('incorrect or unsupported port description received from address http://' +
+                          device_address + it.group(1))
+        elif megaver == 2561:
+            for port_list_url in ['/', '/?cf=3', '/?cf=4']:
+                ports_html = urllib.request.urlopen('http://' + device_address + '/' + device_password + port_list_url).\
+                    read().decode()
+                for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
+                    port_html = urllib.request.urlopen('http://' + device_address + it.group(1)).read().decode()
+                    port_props = self._parse_port_html(port_html)
+                    port_props['name'] = it.group(2)
+                    if 'pn' in port_props:
+                        ports['p' + port_props['pn']] = port_props
+                    else:
+                        logger.warning('incorrect or unsupported port description received from address http://' +
+                              device_address + it.group(1))
 
         return megaid, ports
 
@@ -168,6 +187,7 @@ class MegaDDevicesSet(object):
             else:
                 if type(v) is str and '{value}' in v:
                     result_mutable.append((topic_prefix + '/' + k, v))
+                else:
                     result_const.append((topic_prefix + '/' + k, v))
         return result_mutable, result_const
 
@@ -232,13 +252,16 @@ class MegaDDevicesSet(object):
             for port in updated_ports:
                 v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
                 for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
-                    logger.debug('SHTTP postprocess: ending MQTT message to topic {}'.format(t))
+                    logger.debug('HTTP postprocess: ending MQTT message to topic {}'.format(t))
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
         except Exception as e:
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
     async def on_http_message(self, address, parameters):
         logger.debug('HTTP message from {} with parameters {}'.format(address, parameters))
+
+        if 'pt' not in parameters:
+            return ''
 
         megad_id = 'megad_' + str(address)
         port = 'p' + parameters.get('pt', None)
@@ -573,7 +596,8 @@ def main():
     print("Event loop running forever, press Ctrl+C to interrupt.")
 
     try:
-        asyncio_loop.run_until_complete(async_main(asyncio_loop, conf['http'], conf['mqtt']))
+        task = asyncio_loop.create_task(async_main(asyncio_loop, conf['http'], conf['mqtt']))
+        asyncio_loop.run_until_complete(task)
     finally:
         asyncio_loop.close()
 
