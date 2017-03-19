@@ -6,18 +6,17 @@ import argparse
 import asyncio
 from collections import defaultdict
 import enum
+import functools
 import json
 import logging
 import logging.handlers
 import lxml.etree
-import os.path
 import paho.mqtt.client as mqtt
 import re
 import signal
 import socket
 import sys
 import urllib.request
-
 
 devices = None
 logger = logging.getLogger(__name__)
@@ -231,6 +230,8 @@ class MegaDDevicesSet(object):
         self.mqtt_client = mqtt_client
 
     async def on_http_pool(self):
+        if self.http_server is None or self.mqtt_client is None:
+            return
         try:
             for megad_id, dev in self.devices.items():
                 updated_ports = await dev.fetch_ports_state()
@@ -243,6 +244,8 @@ class MegaDDevicesSet(object):
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
     async def on_http_message_postprocess(self, address):
+        if self.http_server is None or self.mqtt_client is None:
+            return
         megad_id = 'megad_' + str(address)
         try:
             dev = self.devices.get(megad_id, None)
@@ -258,6 +261,8 @@ class MegaDDevicesSet(object):
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
     async def on_http_message(self, address, parameters):
+        if self.http_server is None or self.mqtt_client is None:
+            return
         logger.debug('HTTP message from {} with parameters {}'.format(address, parameters))
 
         if 'pt' not in parameters:
@@ -290,6 +295,8 @@ class MegaDDevicesSet(object):
         return ''
 
     async def on_mqtt_connect(self):
+        if self.http_server is None or self.mqtt_client is None:
+            return
         self.mqtt_value_topic = {}
         for dev_id, dev in self.devices.items():
             await dev.fetch_ports_state()
@@ -304,6 +311,8 @@ class MegaDDevicesSet(object):
                     await self.mqtt_client.async_subscribe(t)
 
     async def on_mqtt_message(self, topic, payload):
+        if self.http_server is None or self.mqtt_client is None:
+            return
         try:
             parts = topic.split('/')
             if mqtt.topic_matches_sub('/devices/+/controls/+/on', topic):
@@ -540,14 +549,9 @@ def async_pooling_cb(loop, interval):
     loop.create_task(pool())
 
 
-async def async_main(loop, conf_http, conf_mqtt):
-    # Create MegaD connector (HTTP server)
+async def main_setup(loop, conf_http, conf_mqtt):
     server_http = aiohttp.web.Server(handler_http, loop=loop)
-    await loop.create_server(server_http,
-                             conf_http.get('address', '0.0.0.0'),
-                             conf_http.get('port', '19780'))
 
-    # Create MQTT connector
     server_mqtt = MQTT(loop,
                        broker=conf_mqtt.get('address', '127.0.0.1'), port=conf_mqtt.get('port', DEFAULT_PORT),
                        client_id=conf_mqtt.get('client_id', 'megad-mqtt-gw'), keepalive=DEFAULT_KEEPALIVE,
@@ -556,28 +560,31 @@ async def async_main(loop, conf_http, conf_mqtt):
                        client_cert=conf_mqtt.get('client_cert', None), tls_insecure=conf_mqtt.get('tls_insecure', None),
                        protocol=conf_mqtt.get('protocol', DEFAULT_PROTOCOL),
                        async_on_message=devices.on_mqtt_message, async_on_connect=devices.on_mqtt_connect)
+
+    devices.set_servers(server_http, server_mqtt)
+
+    await loop.create_server(server_http,
+                             conf_http.get('address', '0.0.0.0'),
+                             conf_http.get('port', '19780'))
+
     await server_mqtt.async_connect()
-    await server_mqtt.async_start()
+    server_mqtt.async_start()
 
     # Create timer for MegaD devices periodic pooling
     pool_interval = conf_http.get('pool', 0)
     if pool_interval > 0:
         loop.call_later(pool_interval, async_pooling_cb, loop, pool_interval)
 
-    # Postinitialisation
-    devices.set_servers(server_http, server_mqtt)
-
-    # Main application loop
-    while loop.is_running():
-        await asyncio.sleep(100 * 3600)
-
-    # Finalisation
-    await server_mqtt.async_stop()
+    return server_http, server_mqtt
 
 
-def async_exit():
+def async_exit(server_mqtt):
     global asyncio_loop
 
+    try:
+        asyncio_loop.run_until_complete(server_mqtt.async_stop())
+    except Exception:
+        pass
     asyncio_loop.stop()
 
 
@@ -591,15 +598,18 @@ def main():
 
     asyncio_loop = asyncio.get_event_loop()
 
-    for signame in ('SIGINT', 'SIGTERM'):
-        asyncio_loop.add_signal_handler(getattr(signal, signame), async_exit)
-    print("Event loop running forever, press Ctrl+C to interrupt.")
-
     try:
-        task = asyncio_loop.create_task(async_main(asyncio_loop, conf['http'], conf['mqtt']))
+        task = asyncio_loop.create_task(main_setup(asyncio_loop, conf['http'], conf['mqtt']))
         asyncio_loop.run_until_complete(task)
-    finally:
+        server_http, server_mqtt = task.result()
+    except Exception as e:
         asyncio_loop.close()
+        print('Error at startup. Exception detail: ' + str(e))
+
+    for signame in ('SIGINT', 'SIGTERM'):
+        asyncio_loop.add_signal_handler(getattr(signal, signame), functools.partial(async_exit, server_mqtt))
+
+    asyncio_loop.run_forever()
 
 
 if __name__ == '__main__':
