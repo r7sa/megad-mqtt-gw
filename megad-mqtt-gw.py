@@ -9,7 +9,6 @@ import functools
 import json
 import logging
 import logging.handlers
-import lxml.etree
 import paho.mqtt.client as mqtt
 import re
 import signal
@@ -34,19 +33,6 @@ class MegaDDevice(object):
     }
 
     def _parse_port_html(self, response_body):
-        if False:
-            if '<body>' not in response_body:
-                response_body = '<body>' + response_body + '</body>'
-            if '<html>' not in response_body:
-                response_body = '<html>' + response_body + '</html>'
-            response_body = response_body.replace('<br>', '<br/>')
-            root = lxml.etree.HTML(response_body, )
-            pn = root.xpath("//input[@name='pn']")
-            if len(pn) > 0:
-                pn = pn[0].attrib['value']
-            else:
-                pn = None
-
         def extract_attrs(s):
             attrs = {}
             for a in s.split(' '):
@@ -79,6 +65,14 @@ class MegaDDevice(object):
         m = re.search(r'<input[^>]+name=mdid\s[^>]+value="([^"]*)">', megaid_html)
         megaid = m.group(1) if m and len(m.group(1)) > 0 else device_address
 
+        # read megad configuration (for later checking)
+        megacf_html_req = urllib.request.urlopen('http://' + device_address + '/' + device_password + '/?cf=1', timeout=10)
+        megacf = {'_local_ip': megacf_html_req.fp.raw._sock.getsockname()[0]}
+        megacf_html = megacf_html_req.read().decode()
+        for it in re.finditer(r'<input[^>]+name=([^> ]+)\s[^>]*value=([^> ]+)>', megacf_html):
+            megacf[it.group(1)] = it.group(2).strip('"')
+
+        # read ports confiruration
         megaver_html = urllib.request.urlopen('http://' + device_address + '/' + device_password + '/', timeout=10).\
             read().decode()
         megaver = 328
@@ -111,19 +105,36 @@ class MegaDDevice(object):
                         logger.warning('incorrect or unsupported port description received from address http://' +
                               device_address + it.group(1))
 
-        return megaid, ports
+        return megaid, megacf, ports
 
     def __init__(self, cfg):
         self.address = cfg['address']
         self.password = cfg['password']
         self.response_mode = MegaDDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
         self.device_base_url = 'http://' + self.address + '/' + self.password + '/'
-        self.mega_id, self.ports = self._query_device(self.address, self.password)
+        self.mega_id, self.mega_cf, self.ports = self._query_device(self.address, self.password)
+        self.mega_cf_checked = False
         self.device_id = 'megad_' + self.mega_id
         self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
 
     def get_ports(self):
         return self.ports
+
+    def check_config(self):
+        # <input name=sip value=192.168.1.110:19780>
+        # <input name=sct maxlength=15 value="megad">
+        result = []
+        if self.mega_cf_checked:
+            return result
+        if 'sip' in self.mega_cf and '_local_ip' in self.mega_cf and \
+                        self.mega_cf['sip'].split(':')[0] != self.mega_cf['_local_ip']:
+            result.append('MegaD {} server IP is incorrect (configured {}, but must be {})'.format(
+                self.mega_id, self.mega_cf['sip'].split(':')[0], self.mega_cf['_local_ip']))
+        if 'sct' in self.mega_cf and self.mega_cf['sct'] != 'megad':
+            result.append('MegaD {} script is incorrect (configured {}, but must be "megad")'.format(
+                self.mega_id, self.mega_cf['sct']))
+        self.mega_cf_checked = True
+        return result
 
     async def fetch_ports_state(self):
         #state = urllib.request.urlopen(self.device_base_url + '?cmd=all').read().decode()
@@ -204,6 +215,7 @@ class MegaDDevicesSet(object):
                 logger.warning('Device {} is excluded from processing.'.format(cf_dev.get('address', '<ADDRESS UNSPECIFIED>')))
 
         cf_mqtt = cfg['mqtt']
+        self.notify_topic = cf_mqtt.get('notify_topic', None)
         self.devices_mqtt_topic = defaultdict(lambda: defaultdict(lambda: MegaDDevicesSet.MQTTPortDesc()))
         self.devices_mqtt_name_topic = defaultdict(lambda: [])
         for dev_id, dev in self.devices.items():
@@ -309,6 +321,10 @@ class MegaDDevicesSet(object):
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
                 for t in self.devices_mqtt_topic[dev.device_id][port].subscribe:
                     await self.mqtt_client.async_subscribe(t)
+            for err_msg in dev.check_config():
+                logger.warning('Device check: {}'.format(err_msg))
+                if self.notify_topic is not None:
+                    await self.mqtt_client.async_publish(self.notify_topic, err_msg, 0, False)
 
     async def on_mqtt_message(self, topic, payload):
         if self.http_server is None or self.mqtt_client is None:
@@ -433,7 +449,7 @@ class MQTT(object):
             logger.error('Unable to connect to the MQTT broker: %s', mqtt.connack_string(result_code))
             self._mqttc.disconnect()
             return
-        logger.debug("Connected from MQTT.")
+        logger.debug("Connected to MQTT.")
         self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_connect)
 
     def _mqtt_on_disconnect(self, _mqttc, _userdata, result_code):
