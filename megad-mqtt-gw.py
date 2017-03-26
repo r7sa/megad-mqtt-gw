@@ -161,8 +161,9 @@ class MegaDDevice(object):
                         self.ports[p_name]['value'] = int(val)
                         updated.append(p_name)
                 else:
-                    logger.warning('Can\'t state of port. MegaD ID: ' + self.mega_id + '. Port: ' + str(idx) +
-                                   '. Value: ' + val)
+                    if 'value' not in self.ports[p_name] or self.ports[p_name]['value'] != val:
+                        self.ports[p_name]['value'] = val
+                        updated.append(p_name)
         return updated
 
     async def send_message(self, control, command):
@@ -185,6 +186,22 @@ class MegaDDevicesSet(object):
             self.mutable = mutable
             self.constant = constant
             self.subscribe = []
+
+    def _prepare_templates(self, templates):
+        self.templates = {}
+        for t_key, t_value in templates.items():
+            s = frozenset([kv for kv in t_key.split('&')])
+            self.templates[s] = t_value
+
+    def _find_template(self, desc):
+        desc_key = frozenset([k + '=' + v for k, v in desc.items()])
+        if desc_key in self.templates:
+            return self.templates[desc_key]
+        for cur_k in desc.keys():
+            r = self._find_template({k: v for k, v in desc.items() if k != cur_k})
+            if r is not None:
+                return r
+        return None
 
     def _make_port_topics(self, topic_prefix, parameters, keywords):
         result_mutable = []
@@ -215,6 +232,7 @@ class MegaDDevicesSet(object):
                 logger.warning('Device {} is excluded from processing.'.format(cf_dev.get('address', '<ADDRESS UNSPECIFIED>')))
 
         cf_mqtt = cfg['mqtt']
+        self._prepare_templates(cf_mqtt['template'])
         self.notify_topic = cf_mqtt.get('notify_topic', None)
         self.devices_mqtt_topic = defaultdict(lambda: defaultdict(lambda: MegaDDevicesSet.MQTTPortDesc()))
         self.devices_mqtt_name_topic = defaultdict(lambda: [])
@@ -222,12 +240,7 @@ class MegaDDevicesSet(object):
             self.devices_mqtt_name_topic[dev.device_id] = cf_mqtt['device_name_topic'].format(device_id=dev.device_id)
             for port, desc in dev.get_ports().items():
                 port_prefix = cf_mqtt['device_port_topic'].format(device_id=dev.device_id, port=port)
-                if 'pty' in desc and 'm' in desc and desc["pty"] + '/' + desc["m"] in cf_mqtt["template"]:
-                    template = cf_mqtt["template"][desc["pty"] + '/' + desc['m']]
-                elif 'pty' in desc and desc["pty"] in cf_mqtt["template"]:
-                    template = cf_mqtt["template"][desc["pty"]]
-                else:
-                    template = None
+                template = self._find_template(desc)
                 if template is not None:
                     r = self._make_port_topics(port_prefix, template, {'device_id': dev.device_id, **desc})
                     self.devices_mqtt_topic[dev.device_id][port].mutable = r[0]

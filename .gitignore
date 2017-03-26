@@ -15,6 +15,7 @@ other/
 parts/
 sdist/
 var/
+.other/
 *.egg-info/
 .installed.cfg
 *.egg
