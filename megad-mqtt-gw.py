@@ -58,45 +58,52 @@ class MegaDDevice(object):
                     props[it.group(1)] = opt_attrs['value']
         return props
 
-    def _query_device(self, device_address, device_password):
-        # query MegaID
-        megaid_html = urllib.request.urlopen('http://' + device_address + '/' + device_password + '/?cf=2', timeout=10).\
-            read().decode()
-        m = re.search(r'<input[^>]+name=mdid\s[^>]+value="([^"]*)">', megaid_html)
-        megaid = m.group(1) if m and len(m.group(1)) > 0 else device_address
+    async def _fetch(self, url):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+        return ''
 
-        # read megad configuration (for later checking)
-        megacf_html_req = urllib.request.urlopen('http://' + device_address + '/' + device_password + '/?cf=1', timeout=10)
-        megacf = {'_local_ip': megacf_html_req.fp.raw._sock.getsockname()[0]}
-        megacf_html = megacf_html_req.read().decode()
-        for it in re.finditer(r'<input[^>]+name=([^> ]+)\s[^>]*value=([^> ]+)>', megacf_html):
-            megacf[it.group(1)] = it.group(2).strip('"')
+    def __init__(self, cfg):
+        global asyncio_loop
 
-        # read ports confiruration
-        megaver_html = urllib.request.urlopen('http://' + device_address + '/' + device_password + '/', timeout=10).\
-            read().decode()
-        megaver = 328
-        if 'MegaD-2561' in megaver_html:
-            megaver = 2561
+        self.address = cfg['address']
+        self.password = cfg['password']
+        self.response_mode = MegaDDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
+        self.device_base_url = 'http://' + self.address + '/' + self.password + '/'
+        asyncio_loop.run_until_complete(self.query_device(self.address, self.password))
+        self.mega_cf_checked = False
+        self.device_id = 'megad_' + self.mega_id
+        self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
 
-        ports = {}
-        if megaver == 328:
-            ports_html = urllib.request.urlopen('http://' + device_address + '/' + device_password).read().decode()
-            for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
-                port_html = urllib.request.urlopen('http://' + device_address + it.group(1)).read().decode()
-                port_props = self._parse_port_html(port_html)
-                port_props['name'] = it.group(2)
-                if 'pn' in port_props:
-                    ports['p' + port_props['pn']] = port_props
-                else:
-                    logger.warning('incorrect or unsupported port description received from address http://' +
-                          device_address + it.group(1))
-        elif megaver == 2561:
-            for port_list_url in ['/', '/?cf=3', '/?cf=4']:
-                ports_html = urllib.request.urlopen('http://' + device_address + '/' + device_password + port_list_url).\
-                    read().decode()
+    def get_ports(self):
+        return self.ports
+
+    async def query_device(self, device_address, device_password):
+        try:
+            # query MegaID
+            megaid_html = await self._fetch('http://' + device_address + '/' + device_password + '/?cf=2')
+            m = re.search(r'<input[^>]+name=mdid\s[^>]+value="([^"]*)">', megaid_html)
+            megaid = m.group(1) if m and len(m.group(1)) > 0 else device_address
+
+            # read megad configuration (for later checking)
+            megacf_html = await self._fetch('http://' + device_address + '/' + device_password + '/?cf=1')
+            megacf = {}
+            for it in re.finditer(r'<input[^>]+name=([^> ]+)\s[^>]*value=([^> ]+)>', megacf_html):
+                megacf[it.group(1)] = it.group(2).strip('"')
+
+            # read ports configuration
+            megaver_html = await self._fetch('http://' + device_address + '/' + device_password + '/')
+            megaver = 328
+            if 'MegaD-2561' in megaver_html:
+                megaver = 2561
+
+            ports = {}
+            if megaver == 328:
+                ports_html = await self._fetch('http://' + device_address + '/' + device_password)
                 for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
-                    port_html = urllib.request.urlopen('http://' + device_address + it.group(1)).read().decode()
+                    port_html = await self._fetch('http://' + device_address + it.group(1))
                     port_props = self._parse_port_html(port_html)
                     port_props['name'] = it.group(2)
                     if 'pn' in port_props:
@@ -104,21 +111,22 @@ class MegaDDevice(object):
                     else:
                         logger.warning('incorrect or unsupported port description received from address http://' +
                               device_address + it.group(1))
+            elif megaver == 2561:
+                for port_list_url in ['/', '/?cf=3', '/?cf=4']:
+                    ports_html = await self._fetch('http://' + device_address + '/' + device_password + port_list_url)
+                    for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
+                        port_html = await self._fetch('http://' + device_address + it.group(1))
+                        port_props = self._parse_port_html(port_html)
+                        port_props['name'] = it.group(2)
+                        if 'pn' in port_props:
+                            ports['p' + port_props['pn']] = port_props
+                        else:
+                            logger.warning('incorrect or unsupported port description received from address http://' +
+                                  device_address + it.group(1))
 
-        return megaid, megacf, ports
-
-    def __init__(self, cfg):
-        self.address = cfg['address']
-        self.password = cfg['password']
-        self.response_mode = MegaDDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
-        self.device_base_url = 'http://' + self.address + '/' + self.password + '/'
-        self.mega_id, self.mega_cf, self.ports = self._query_device(self.address, self.password)
-        self.mega_cf_checked = False
-        self.device_id = 'megad_' + self.mega_id
-        self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
-
-    def get_ports(self):
-        return self.ports
+            self.mega_id, self.mega_cf, self.ports = megaid, megacf, ports
+        except aiohttp.ClientError:
+            self.mega_id, self.mega_cf, self.ports = None, None, None
 
     def check_config(self):
         # <input name=sip value=192.168.1.110:19780>
@@ -137,7 +145,6 @@ class MegaDDevice(object):
         return result
 
     async def fetch_ports_state(self):
-        #state = urllib.request.urlopen(self.device_base_url + '?cmd=all').read().decode()
         async with aiohttp.ClientSession() as session:
             async with session.get(self.device_base_url + '?cmd=all') as resp:
                 if resp.status != 200:
@@ -169,7 +176,6 @@ class MegaDDevice(object):
     async def send_message(self, control, command):
         logger.debug('HTTP message: ctrl=%s cmd=%s', control, command)
 
-        #ports_html = urllib.request.urlopen(self.device_base_url + '?cmd=' + control[1:] + ':' + command).read().decode()
         async with aiohttp.ClientSession() as session:
             async with session.get(self.device_base_url + '?cmd=' + control[1:] + ':' + command) as resp:
                 if resp.status != 200:
@@ -221,11 +227,16 @@ class MegaDDevicesSet(object):
     def __init__(self, cfg):
         cf_devices = cfg['devices']
         self.devices = {}
+        self.disabled_devices = []
         for cf_dev in cf_devices:
             try:
                 dev = MegaDDevice(cf_dev)
-                self.devices[dev.device_id] = dev
-                logger.info('Added device ' + dev.device_id)
+                if dev.device_id is not None:
+                    self.devices[dev.device_id] = dev
+                    logger.info('Added device ' + dev.device_id)
+                else:
+                    self.disabled_devices.append(dev)
+                    logger.info('Device {} added as disabled'.format(dev.address))
             except Exception as e:
                 logger.warning('Error at add device ' + cf_dev.get('id', '<ID UNSPECIFIED>') + ' (' +
                                 cf_dev.get('address', '<ADDRESS UNSPECIFIED>') + '). Exception details: ' + str(e))
@@ -247,7 +258,7 @@ class MegaDDevicesSet(object):
                     self.devices_mqtt_topic[dev.device_id][port].constant = r[1]
                     self.devices_mqtt_topic[dev.device_id][port].subscribe = [port_prefix + '/on']
 
-        self.http_client = None
+        self.http_server = None
         self.mqtt_client = None
 
     def set_servers(self, http_server, mqtt_client):
@@ -255,22 +266,25 @@ class MegaDDevicesSet(object):
         self.mqtt_client = mqtt_client
 
     async def on_http_pool(self):
-        if self.http_server is None or self.mqtt_client is None:
-            return
+        for dev in self.disabled_devices:
+            await dev.query_device()
+            if dev.device_id is not None:
+                self.devices[dev.device_id] = dev
+                logger.info('Device enabled ' + dev.device_id)
+
         try:
             for megad_id, dev in self.devices.items():
                 updated_ports = await dev.fetch_ports_state()
                 for port in updated_ports:
                     v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
                     for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
-                        logger.debug('HTTP pool: Sending MQTT message to topic {}'.format(t))
-                        await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
+                        vv = v.format(**v_keyword)
+                        logger.debug('HTTP pool: Sending MQTT message to topic {} value {}'.format(t, vv))
+                        await self.mqtt_client.async_publish(t, vv, 0, True)
         except Exception as e:
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
     async def on_http_message_postprocess(self, address):
-        if self.http_server is None or self.mqtt_client is None:
-            return
         megad_id = 'megad_' + str(address)
         try:
             dev = self.devices.get(megad_id, None)
@@ -286,8 +300,6 @@ class MegaDDevicesSet(object):
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
     async def on_http_message(self, address, parameters):
-        if self.http_server is None or self.mqtt_client is None:
-            return
         logger.debug('HTTP message from {} with parameters {}'.format(address, parameters))
 
         if 'pt' not in parameters:
@@ -320,8 +332,6 @@ class MegaDDevicesSet(object):
         return ''
 
     async def on_mqtt_connect(self):
-        if self.http_server is None or self.mqtt_client is None:
-            return
         self.mqtt_value_topic = {}
         for dev_id, dev in self.devices.items():
             await dev.fetch_ports_state()
@@ -340,8 +350,6 @@ class MegaDDevicesSet(object):
                     await self.mqtt_client.async_publish(self.notify_topic, err_msg, 0, False)
 
     async def on_mqtt_message(self, topic, payload):
-        if self.http_server is None or self.mqtt_client is None:
-            return
         try:
             parts = topic.split('/')
             if mqtt.topic_matches_sub('/devices/+/controls/+/on', topic):
@@ -381,7 +389,7 @@ DEFAULT_PROTOCOL = PROTOCOL_311
 MAX_RECONNECT_WAIT = 300  # seconds
 
 
-class MQTT(object):
+class MQTTConnector(object):
     def __init__(self, loop, broker, port, client_id, keepalive, username, password,
                  certificate, client_key, client_cert, tls_insecure, protocol,
                  async_on_connect, async_on_message):
@@ -404,33 +412,11 @@ class MQTT(object):
         self._mqttc.on_disconnect = self._mqtt_on_disconnect
         self._mqttc.on_message = self._mqtt_on_message
 
-    async def async_publish(self, topic, payload, qos=DEFAULT_QOS, retain=DEFAULT_RETAIN):
-        with (await self._paho_lock):
-            await self.loop.run_in_executor(None, self._mqttc.publish, topic, payload, qos, retain)
-
-    async def async_on_message(self, topic, payload, qos):
-        await self.async_on_message_cb(topic, payload)
-
-    async def async_connect(self):
-        tries = 0
-        while True:
-            try:
-                result = await self.loop.run_in_executor(None, self._mqttc.connect, self.broker, self.port, self.keepalive)
-                if result == 0:
-                    return
-            except socket.error:
-                pass
-            logger.warning("Disconnected from MQTT. Trying to reconnect.")
-            await asyncio.sleep(min(2**tries, MAX_RECONNECT_WAIT))
-            tries += 1
-
-    async def async_on_connect(self):
-        await self.async_on_connect_cb()
-
-    def async_start(self):
+    def start(self):
+        self._mqttc.connect_async(self.broker, self.port, self.keepalive)
         return self.loop.run_in_executor(None, self._mqttc.loop_start)
 
-    def async_stop(self):
+    def stop(self):
         def stop():
             self._mqttc.disconnect()
             self._mqttc.loop_stop()
@@ -449,6 +435,10 @@ class MQTT(object):
             await asyncio.sleep(0, loop=self.loop)
         _raise_on_error(result)
 
+    async def async_publish(self, topic, payload, qos=DEFAULT_QOS, retain=DEFAULT_RETAIN):
+        with (await self._paho_lock):
+            await self.loop.run_in_executor(None, self._mqttc.publish, topic, payload, qos, retain)
+
     def _async_add_job(self, target, *args):
         if asyncio.iscoroutine(target):
             self.loop.create_task(target)
@@ -463,13 +453,15 @@ class MQTT(object):
             self._mqttc.disconnect()
             return
         logger.debug("Connected to MQTT.")
-        self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_connect)
+        if self.async_on_connect_cb is not None:
+            self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_connect_cb)
 
     def _mqtt_on_disconnect(self, _mqttc, _userdata, result_code):
         logger.debug("Disconnected from MQTT. Result code: {} ({}) ".format(mqtt.error_string(result_code), result_code))
 
     def _mqtt_on_message(self, _mqttc, _userdata, msg):
-        self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_message, msg.topic, msg.payload, msg.qos)
+        if self.async_on_message_cb is not None:
+            self.loop.call_soon_threadsafe(self._async_add_job, self.async_on_message_cb, msg.topic, msg.payload)
 
 
 def _raise_on_error(result):
@@ -482,27 +474,36 @@ def _raise_on_error(result):
 ###############################################################################
 
 
-async def handler_http_postprocess(host):
-    await devices.on_http_message_postprocess(host)
+class HTTPConnector(object):
+    def __init__(self, loop, address, port):
+        self.loop = loop
+        self.address = address
+        self.port = port
+        self.server = aiohttp.web.Server(self.handler_http, loop=loop)
 
+    def start(self):
+        self.loop.create_server(self.server, self.address, self.port)
 
-async def handler_http(request):
-    if request.rel_url.path != '/megad':
-        return aiohttp.web.Response(text="ERROR: Incorrect path")
-    peername = request.transport.get_extra_info('peername')
-    if peername is None:
-        return aiohttp.web.Response(text="ERROR: Internal error - unknown remote address of peer")
-    host, port = peername
-    command = await devices.on_http_message(host, request.rel_url.query)
+    async def handler_http_postprocess(self, host):
+        await devices.on_http_message_postprocess(host)
 
-    request.transport._loop.create_task(handler_http_postprocess(host))
+    async def handler_http(self, request):
+        if request.rel_url.path != '/megad':
+            return aiohttp.web.Response(text="ERROR: Incorrect path")
+        peername = request.transport.get_extra_info('peername')
+        if peername is None:
+            return aiohttp.web.Response(text="ERROR: Internal error - unknown remote address of peer")
+        host, port = peername
+        command = await devices.on_http_message(host, request.rel_url.query)
 
-    # hack to send headers and body in one packet as required by MegaD-328
-    request._writer.set_tcp_cork(True)
-    request._writer.set_tcp_nodelay(False)
-    response = aiohttp.web.Response(text=command)
-    response.force_close()
-    return response
+        self.loop.create_task(self.handler_http_postprocess(host))
+
+        # hack to send headers and body in one packet as required by MegaD-328
+        request._writer.set_tcp_cork(True)
+        request._writer.set_tcp_nodelay(False)
+        response = aiohttp.web.Response(text=command)
+        response.force_close()
+        return response
 
 
 ###############################################################################
@@ -579,9 +580,8 @@ def async_pooling_cb(loop, interval):
 
 
 async def main_setup(loop, conf_http, conf_mqtt):
-    server_http = aiohttp.web.Server(handler_http, loop=loop)
-
-    server_mqtt = MQTT(loop,
+    server_http = HTTPConnector(loop, conf_http.get('address', '0.0.0.0'), conf_http.get('port', '19780'))
+    server_mqtt = MQTTConnector(loop,
                        broker=conf_mqtt.get('address', '127.0.0.1'), port=conf_mqtt.get('port', DEFAULT_PORT),
                        client_id=conf_mqtt.get('client_id', 'megad-mqtt-gw'), keepalive=DEFAULT_KEEPALIVE,
                        username=conf_mqtt.get('username', None), password=conf_mqtt.get('password', None),
@@ -592,12 +592,8 @@ async def main_setup(loop, conf_http, conf_mqtt):
 
     devices.set_servers(server_http, server_mqtt)
 
-    await loop.create_server(server_http,
-                             conf_http.get('address', '0.0.0.0'),
-                             conf_http.get('port', '19780'))
-
-    await server_mqtt.async_connect()
-    server_mqtt.async_start()
+    server_http.start()
+    server_mqtt.start()
 
     # Create timer for MegaD devices periodic pooling
     pool_interval = conf_http.get('pool', 0)
@@ -608,8 +604,6 @@ async def main_setup(loop, conf_http, conf_mqtt):
 
 
 def async_exit(server_mqtt):
-    global asyncio_loop
-
     try:
         asyncio_loop.run_until_complete(server_mqtt.async_stop())
     except Exception:
@@ -619,13 +613,12 @@ def async_exit(server_mqtt):
 
 def main():
     global asyncio_loop
+    asyncio_loop = asyncio.get_event_loop()
 
     conf = main_configure()
     if conf is None:
         print('Error at loading configuration. For detail see messages above')
         return
-
-    asyncio_loop = asyncio.get_event_loop()
 
     try:
         task = asyncio_loop.create_task(main_setup(asyncio_loop, conf['http'], conf['mqtt']))
@@ -634,6 +627,7 @@ def main():
     except Exception as e:
         asyncio_loop.close()
         print('Error at startup. Exception detail: ' + str(e))
+        return
 
     for signame in ('SIGINT', 'SIGTERM'):
         asyncio_loop.add_signal_handler(getattr(signal, signame), functools.partial(async_exit, server_mqtt))
