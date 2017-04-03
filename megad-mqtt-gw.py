@@ -328,8 +328,9 @@ class MegaDDevicesSet(object):
             for port in updated_ports:
                 v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
                 for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
-                    logger.debug('HTTP postprocess: ending MQTT message to topic {}'.format(t))
-                    await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
+                    vv = v.format(**v_keyword)
+                    logger.debug('HTTP postprocess: Sending MQTT message to topic {} value {}'.format(t, vv))
+                    await self.mqtt_client.async_publish(t, vv, 0, True)
         except Exception as e:
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
@@ -349,14 +350,28 @@ class MegaDDevicesSet(object):
             if port_data is None:
                 return ''
             if port_data['pty'] == '0':
-                port_data['value'] = parameters.get('m', 1)
+                result = ''
+                param_m = parameters.get('m', '0')
+                if param_m == '0':
+                    port_data['value'] = '1'
+                    if dev.response_mode == MegaDHTTPDevice.ResponseMode.DEVICE and \
+                                    port_data['m'] in ('0', '1'):  # P, P&R
+                        result = port_data.get('ecmd', '')
+                elif param_m == '1':
+                    port_data['value'] = '0'
+                    if dev.response_mode == MegaDHTTPDevice.ResponseMode.DEVICE and \
+                                    port_data['m'] in ('1', '2'):  # P&R, R
+                        result = port_data.get('ecmd', '')
+                elif param_m == '2':
+                    port_data['value'] = 'LONG'
+                else:
+                    port_data['value'] = '1'
+                    logger.warning('UNKNOWN mode type {}'.format(param_m))
                 v_keyword = {'device_id': dev.device_id, **port_data}
                 for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
-                    logger.debug('HTTP message: Sending MQTT message to topic {}'.format(t))
-                    await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
-                result = ''
-                if dev.response_mode == MegaDHTTPDevice.ResponseMode.DEVICE:
-                    result = port_data.get('ecmd', '')
+                    vv = v.format(**v_keyword) if type(v) is str else str(v)
+                    logger.debug('HTTP message: Sending MQTT message to topic {} value {}'.format(t, vv))
+                    await self.mqtt_client.async_publish(t, vv, 0, True)
                 logger.debug('HTTP response is {}'.format(result))
                 return result
             else:
