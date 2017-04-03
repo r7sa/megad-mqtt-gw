@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import aiohttp
+import aiohttp.web_server
 import aiohttp.web
 import argparse
 import asyncio
@@ -12,16 +13,14 @@ import logging.handlers
 import paho.mqtt.client as mqtt
 import re
 import signal
-import socket
 import sys
-import urllib.request
 
 
 devices = None
 logger = logging.getLogger(__name__)
 
 
-class MegaDDevice(object):
+class MegaDHTTPDevice(object):
     class ResponseMode(enum.Enum):
         EMPTY = 0
         DEVICE = 1
@@ -70,59 +69,63 @@ class MegaDDevice(object):
 
         self.address = cfg['address']
         self.password = cfg['password']
-        self.response_mode = MegaDDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
+        self.response_mode = MegaDHTTPDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
         self.device_base_url = 'http://' + self.address + '/' + self.password + '/'
-        asyncio_loop.run_until_complete(self.query_device(self.address, self.password))
+        asyncio_loop.run_until_complete(self.query_device())
         self.mega_cf_checked = False
-        self.device_id = 'megad_' + self.mega_id
-        self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
+        if self.mega_id is not None:
+            self.device_id = 'megad_' + self.mega_id
+            self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
+        else:
+            self.device_id = None
+            self.device_name = None
 
     def get_ports(self):
         return self.ports
 
-    async def query_device(self, device_address, device_password):
+    async def query_device(self):
         try:
             # query MegaID
-            megaid_html = await self._fetch('http://' + device_address + '/' + device_password + '/?cf=2')
+            megaid_html = await self._fetch('http://' + self.address + '/' + self.password + '/?cf=2')
             m = re.search(r'<input[^>]+name=mdid\s[^>]+value="([^"]*)">', megaid_html)
-            megaid = m.group(1) if m and len(m.group(1)) > 0 else device_address
+            megaid = m.group(1) if m and len(m.group(1)) > 0 else self.address
 
             # read megad configuration (for later checking)
-            megacf_html = await self._fetch('http://' + device_address + '/' + device_password + '/?cf=1')
+            megacf_html = await self._fetch('http://' + self.address + '/' + self.password + '/?cf=1')
             megacf = {}
             for it in re.finditer(r'<input[^>]+name=([^> ]+)\s[^>]*value=([^> ]+)>', megacf_html):
                 megacf[it.group(1)] = it.group(2).strip('"')
 
             # read ports configuration
-            megaver_html = await self._fetch('http://' + device_address + '/' + device_password + '/')
+            megaver_html = await self._fetch('http://' + self.address + '/' + self.password + '/')
             megaver = 328
             if 'MegaD-2561' in megaver_html:
                 megaver = 2561
 
             ports = {}
             if megaver == 328:
-                ports_html = await self._fetch('http://' + device_address + '/' + device_password)
+                ports_html = await self._fetch('http://' + self.address + '/' + self.password)
                 for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
-                    port_html = await self._fetch('http://' + device_address + it.group(1))
+                    port_html = await self._fetch('http://' + self.address + it.group(1))
                     port_props = self._parse_port_html(port_html)
                     port_props['name'] = it.group(2)
                     if 'pn' in port_props:
                         ports['p' + port_props['pn']] = port_props
                     else:
                         logger.warning('incorrect or unsupported port description received from address http://' +
-                              device_address + it.group(1))
+                                       self.address + it.group(1))
             elif megaver == 2561:
                 for port_list_url in ['/', '/?cf=3', '/?cf=4']:
-                    ports_html = await self._fetch('http://' + device_address + '/' + device_password + port_list_url)
+                    ports_html = await self._fetch('http://' + self.address + '/' + self.password + port_list_url)
                     for it in re.finditer(r'<a href=([^<>]*?\?pt=.*?)>(.*?)</a>', ports_html):
-                        port_html = await self._fetch('http://' + device_address + it.group(1))
+                        port_html = await self._fetch('http://' + self.address + it.group(1))
                         port_props = self._parse_port_html(port_html)
                         port_props['name'] = it.group(2)
                         if 'pn' in port_props:
                             ports['p' + port_props['pn']] = port_props
                         else:
                             logger.warning('incorrect or unsupported port description received from address http://' +
-                                  device_address + it.group(1))
+                                           self.address + it.group(1))
 
             self.mega_id, self.mega_cf, self.ports = megaid, megacf, ports
         except aiohttp.ClientError:
@@ -185,29 +188,32 @@ class MegaDDevice(object):
                     return command
         return None
 
-
-class MegaDDevicesSet(object):
-    class MQTTPortDesc:
-        def __init__(self, mutable=[], constant=[]):
-            self.mutable = mutable
-            self.constant = constant
-            self.subscribe = []
-
-    def _prepare_templates(self, templates):
+class MegaDMQTTTemplates(object):
+    def __init__(self, name_topic, port_topic, templates):
+        self.name_topic = name_topic
+        self.port_topic = port_topic
         self.templates = {}
         for t_key, t_value in templates.items():
             s = frozenset([kv for kv in t_key.split('&')])
             self.templates[s] = t_value
 
-    def _find_template(self, desc):
+    def find_port(self, desc):
         desc_key = frozenset([k + '=' + v for k, v in desc.items()])
         if desc_key in self.templates:
             return self.templates[desc_key]
         for cur_k in desc.keys():
-            r = self._find_template({k: v for k, v in desc.items() if k != cur_k})
+            r = self.find_port({k: v for k, v in desc.items() if k != cur_k})
             if r is not None:
                 return r
         return None
+
+
+class MegaDMQTTDevice(object):
+    class Port(object):
+        def __init__(self, mutable=[], constant=[]):
+            self.mutable = mutable
+            self.constant = constant
+            self.subscribe = []
 
     def _make_port_topics(self, topic_prefix, parameters, keywords):
         result_mutable = []
@@ -224,13 +230,48 @@ class MegaDDevicesSet(object):
                     result_const.append((topic_prefix + '/' + k, v))
         return result_mutable, result_const
 
+    def __init__(self):
+        self.port = defaultdict(lambda: MegaDMQTTDevice.Port())
+        self.name_topic = None
+
+    def initialize(self, dev, mqtt_templates):
+        self.name_topic = mqtt_templates.name_topic.format(device_id=dev.device_id)
+        for port, desc in dev.get_ports().items():
+            template = mqtt_templates.find_port(desc)
+            if template is not None:
+                port_prefix = mqtt_templates.port_topic.format(device_id=dev.device_id, port=port)
+                r = self._make_port_topics(port_prefix, template, {'device_id': dev.device_id, **desc})
+                self.port[port].mutable = r[0]
+                self.port[port].constant = r[1]
+                self.port[port].subscribe = [port_prefix + '/on']
+
+
+class MegaDDevicesSet(object):
+    async def _mqtt_publish_device(self, dev):
+        mqtt_dev = self.mqtt_device[dev.device_id]
+        await dev.fetch_ports_state()
+        await self.mqtt_client.async_publish(mqtt_dev.name_topic, dev.device_name, 0, True)
+        for port, port_data in dev.get_ports().items():
+            mqtt_port = mqtt_dev.port[port]
+            v_keyword = {'device_id': dev.device_id, **port_data}
+            for t, v in mqtt_port.constant:
+                await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
+            for t, v in mqtt_port.mutable:
+                await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
+            for t in mqtt_port.subscribe:
+                await self.mqtt_client.async_subscribe(t)
+        for err_msg in dev.check_config():
+            logger.warning('Device check: {}'.format(err_msg))
+            if self.mqtt_notify_topic is not None:
+                await self.mqtt_client.async_publish(self.mqtt_notify_topic, err_msg, 0, False)
+
     def __init__(self, cfg):
         cf_devices = cfg['devices']
         self.devices = {}
         self.disabled_devices = []
         for cf_dev in cf_devices:
             try:
-                dev = MegaDDevice(cf_dev)
+                dev = MegaDHTTPDevice(cf_dev)
                 if dev.device_id is not None:
                     self.devices[dev.device_id] = dev
                     logger.info('Added device ' + dev.device_id)
@@ -243,21 +284,11 @@ class MegaDDevicesSet(object):
                 logger.warning('Device {} is excluded from processing.'.format(cf_dev.get('address', '<ADDRESS UNSPECIFIED>')))
 
         cf_mqtt = cfg['mqtt']
-        self._prepare_templates(cf_mqtt['template'])
-        self.notify_topic = cf_mqtt.get('notify_topic', None)
-        self.devices_mqtt_topic = defaultdict(lambda: defaultdict(lambda: MegaDDevicesSet.MQTTPortDesc()))
-        self.devices_mqtt_name_topic = defaultdict(lambda: [])
+        self.mqtt_notify_topic = cf_mqtt.get('notify_topic', None)
+        self.mqtt_templates = MegaDMQTTTemplates(cf_mqtt['device_name_topic'], cf_mqtt['device_port_topic'], cf_mqtt['template'])
+        self.mqtt_device = defaultdict(lambda: MegaDMQTTDevice())
         for dev_id, dev in self.devices.items():
-            self.devices_mqtt_name_topic[dev.device_id] = cf_mqtt['device_name_topic'].format(device_id=dev.device_id)
-            for port, desc in dev.get_ports().items():
-                port_prefix = cf_mqtt['device_port_topic'].format(device_id=dev.device_id, port=port)
-                template = self._find_template(desc)
-                if template is not None:
-                    r = self._make_port_topics(port_prefix, template, {'device_id': dev.device_id, **desc})
-                    self.devices_mqtt_topic[dev.device_id][port].mutable = r[0]
-                    self.devices_mqtt_topic[dev.device_id][port].constant = r[1]
-                    self.devices_mqtt_topic[dev.device_id][port].subscribe = [port_prefix + '/on']
-
+            self.mqtt_device[dev_id].initialize(dev, self.mqtt_templates)
         self.http_server = None
         self.mqtt_client = None
 
@@ -266,10 +297,13 @@ class MegaDDevicesSet(object):
         self.mqtt_client = mqtt_client
 
     async def on_http_pool(self):
-        for dev in self.disabled_devices:
+        for dev in list(self.disabled_devices):
             await dev.query_device()
             if dev.device_id is not None:
                 self.devices[dev.device_id] = dev
+                self.disabled_devices.remove(dev)
+                self.mqtt_device[dev.device_id].intialize(dev, self.mqtt_templates)
+                await self._mqtt_publish_device(dev)
                 logger.info('Device enabled ' + dev.device_id)
 
         try:
@@ -277,7 +311,7 @@ class MegaDDevicesSet(object):
                 updated_ports = await dev.fetch_ports_state()
                 for port in updated_ports:
                     v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
-                    for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                    for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
                         vv = v.format(**v_keyword)
                         logger.debug('HTTP pool: Sending MQTT message to topic {} value {}'.format(t, vv))
                         await self.mqtt_client.async_publish(t, vv, 0, True)
@@ -293,7 +327,7 @@ class MegaDDevicesSet(object):
             updated_ports = await dev.fetch_ports_state()
             for port in updated_ports:
                 v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
-                for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
                     logger.debug('HTTP postprocess: ending MQTT message to topic {}'.format(t))
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
         except Exception as e:
@@ -317,11 +351,11 @@ class MegaDDevicesSet(object):
             if port_data['pty'] == '0':
                 port_data['value'] = parameters.get('m', 1)
                 v_keyword = {'device_id': dev.device_id, **port_data}
-                for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
+                for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
                     logger.debug('HTTP message: Sending MQTT message to topic {}'.format(t))
                     await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
                 result = ''
-                if dev.response_mode == MegaDDevice.ResponseMode.DEVICE:
+                if dev.response_mode == MegaDHTTPDevice.ResponseMode.DEVICE:
                     result = port_data.get('ecmd', '')
                 logger.debug('HTTP response is {}'.format(result))
                 return result
@@ -332,22 +366,8 @@ class MegaDDevicesSet(object):
         return ''
 
     async def on_mqtt_connect(self):
-        self.mqtt_value_topic = {}
         for dev_id, dev in self.devices.items():
-            await dev.fetch_ports_state()
-            await self.mqtt_client.async_publish(self.devices_mqtt_name_topic[dev.device_id], dev.device_name, 0, True)
-            for port, port_data in dev.get_ports().items():
-                v_keyword = {'device_id': dev.device_id, **port_data}
-                for t, v in self.devices_mqtt_topic[dev.device_id][port].constant:
-                    await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
-                for t, v in self.devices_mqtt_topic[dev.device_id][port].mutable:
-                    await self.mqtt_client.async_publish(t, v.format(**v_keyword) if type(v) is str else str(v), 0, True)
-                for t in self.devices_mqtt_topic[dev.device_id][port].subscribe:
-                    await self.mqtt_client.async_subscribe(t)
-            for err_msg in dev.check_config():
-                logger.warning('Device check: {}'.format(err_msg))
-                if self.notify_topic is not None:
-                    await self.mqtt_client.async_publish(self.notify_topic, err_msg, 0, False)
+            await self._mqtt_publish_device(dev)
 
     async def on_mqtt_message(self, topic, payload):
         try:
@@ -365,7 +385,7 @@ class MegaDDevicesSet(object):
                 updated_ports = await dev.fetch_ports_state()
                 for port in updated_ports:
                     v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
-                    for t, v in self.devices_mqtt_topic[device_id][port].mutable:
+                    for t, v in self.mqtt_device[device_id].port[port].mutable:
                         logger.debug('MQTT outbound message for topic {}'.format(t))
                         await self.mqtt_client.async_publish(t, v.format(**v_keyword), 0, True)
         except Exception as e:
@@ -373,18 +393,18 @@ class MegaDDevicesSet(object):
 
 
 ###############################################################################
-#                    M Q T T     Protocol handler                             #
+#                           Protocol handlers                                 #
 ###############################################################################
 
 
-PROTOCOL_31 = '3.1'
-PROTOCOL_311 = '3.1.1'
+MQTT_PROTOCOL_31 = '3.1'
+MQTT_PROTOCOL_311 = '3.1.1'
 
-DEFAULT_PORT = 1883
-DEFAULT_KEEPALIVE = 60
-DEFAULT_QOS = 0
-DEFAULT_RETAIN = False
-DEFAULT_PROTOCOL = PROTOCOL_311
+MQTT_DEFAULT_PORT = 1883
+MQTT_DEFAULT_KEEPALIVE = 60
+MQTT_DEFAULT_QOS = 0
+MQTT_DEFAULT_RETAIN = False
+MQTT_DEFAULT_PROTOCOL = MQTT_PROTOCOL_311
 
 MAX_RECONNECT_WAIT = 300  # seconds
 
@@ -401,7 +421,7 @@ class MQTTConnector(object):
         self.async_on_message_cb = async_on_message
         self._paho_lock = asyncio.Lock(loop=loop)
         self._mqttc = mqtt.Client(client_id='' if client_id is None else client_id,
-                                  protocol=mqtt.MQTTv31 if protocol == PROTOCOL_31 else mqtt.MQTTv311)
+                                  protocol=mqtt.MQTTv31 if protocol == MQTT_PROTOCOL_31 else mqtt.MQTTv311)
         if username is not None:
             self._mqttc.username_pw_set(username, password)
         if certificate is not None:
@@ -423,7 +443,7 @@ class MQTTConnector(object):
 
         return self.loop.run_in_executor(None, stop)
 
-    async def async_subscribe(self, topic, qos=DEFAULT_QOS):
+    async def async_subscribe(self, topic, qos=MQTT_DEFAULT_QOS):
         with (await self._paho_lock):
             result, mid = await self.loop.run_in_executor(None, self._mqttc.subscribe, topic, qos)
             await asyncio.sleep(0, loop=self.loop)
@@ -435,7 +455,7 @@ class MQTTConnector(object):
             await asyncio.sleep(0, loop=self.loop)
         _raise_on_error(result)
 
-    async def async_publish(self, topic, payload, qos=DEFAULT_QOS, retain=DEFAULT_RETAIN):
+    async def async_publish(self, topic, payload, qos=MQTT_DEFAULT_QOS, retain=MQTT_DEFAULT_RETAIN):
         with (await self._paho_lock):
             await self.loop.run_in_executor(None, self._mqttc.publish, topic, payload, qos, retain)
 
@@ -469,25 +489,23 @@ def _raise_on_error(result):
         raise Exception('Error talking to MQTT: {}'.format(mqtt.error_string(result)))
 
 
-###############################################################################
-#                    H T T P     Protocol handler                             #
-###############################################################################
-
-
 class HTTPConnector(object):
     def __init__(self, loop, address, port):
         self.loop = loop
         self.address = address
         self.port = port
-        self.server = aiohttp.web.Server(self.handler_http, loop=loop)
+        self.server_http = aiohttp.web_server.Server(self.handler, loop=loop)
+        self.server_socket = None
 
-    def start(self):
-        self.loop.create_server(self.server, self.address, self.port)
+    async def start(self):
+        self.server_socket = await self.loop.create_server(self.server_http, self.address, self.port)
 
-    async def handler_http_postprocess(self, host):
-        await devices.on_http_message_postprocess(host)
+    async def stop(self):
+        await self.server_http.shutdown()
+        self.server_http = None
+        self.server_socket = None
 
-    async def handler_http(self, request):
+    async def handler(self, request):
         if request.rel_url.path != '/megad':
             return aiohttp.web.Response(text="ERROR: Incorrect path")
         peername = request.transport.get_extra_info('peername')
@@ -496,7 +514,7 @@ class HTTPConnector(object):
         host, port = peername
         command = await devices.on_http_message(host, request.rel_url.query)
 
-        self.loop.create_task(self.handler_http_postprocess(host))
+        self.loop.create_task(devices.on_http_message_postprocess(host))
 
         # hack to send headers and body in one packet as required by MegaD-328
         request._writer.set_tcp_cork(True)
@@ -582,18 +600,18 @@ def async_pooling_cb(loop, interval):
 async def main_setup(loop, conf_http, conf_mqtt):
     server_http = HTTPConnector(loop, conf_http.get('address', '0.0.0.0'), conf_http.get('port', '19780'))
     server_mqtt = MQTTConnector(loop,
-                       broker=conf_mqtt.get('address', '127.0.0.1'), port=conf_mqtt.get('port', DEFAULT_PORT),
-                       client_id=conf_mqtt.get('client_id', 'megad-mqtt-gw'), keepalive=DEFAULT_KEEPALIVE,
+                       broker=conf_mqtt.get('address', '127.0.0.1'), port=conf_mqtt.get('port', MQTT_DEFAULT_PORT),
+                       client_id=conf_mqtt.get('client_id', 'megad-mqtt-gw'), keepalive=MQTT_DEFAULT_KEEPALIVE,
                        username=conf_mqtt.get('username', None), password=conf_mqtt.get('password', None),
                        certificate=conf_mqtt.get('certificate', None), client_key=conf_mqtt.get('client_key', None),
                        client_cert=conf_mqtt.get('client_cert', None), tls_insecure=conf_mqtt.get('tls_insecure', None),
-                       protocol=conf_mqtt.get('protocol', DEFAULT_PROTOCOL),
+                       protocol=conf_mqtt.get('protocol', MQTT_DEFAULT_PROTOCOL),
                        async_on_message=devices.on_mqtt_message, async_on_connect=devices.on_mqtt_connect)
 
     devices.set_servers(server_http, server_mqtt)
 
-    server_http.start()
-    server_mqtt.start()
+    await server_http.start()
+    await server_mqtt.start()
 
     # Create timer for MegaD devices periodic pooling
     pool_interval = conf_http.get('pool', 0)
@@ -603,9 +621,10 @@ async def main_setup(loop, conf_http, conf_mqtt):
     return server_http, server_mqtt
 
 
-def async_exit(server_mqtt):
+def async_exit(server_http, server_mqtt):
     try:
-        asyncio_loop.run_until_complete(server_mqtt.async_stop())
+        # TODO: server_http.stop()
+        server_mqtt.stop()
     except Exception:
         pass
     asyncio_loop.stop()
@@ -623,14 +642,14 @@ def main():
     try:
         task = asyncio_loop.create_task(main_setup(asyncio_loop, conf['http'], conf['mqtt']))
         asyncio_loop.run_until_complete(task)
-        server_http, server_mqtt = task.result()
+        srv_http, srv_mqtt = task.result()
     except Exception as e:
         asyncio_loop.close()
         print('Error at startup. Exception detail: ' + str(e))
         return
 
     for signame in ('SIGINT', 'SIGTERM'):
-        asyncio_loop.add_signal_handler(getattr(signal, signame), functools.partial(async_exit, server_mqtt))
+        asyncio_loop.add_signal_handler(getattr(signal, signame), functools.partial(async_exit, srv_http, srv_mqtt))
 
     asyncio_loop.run_forever()
 
