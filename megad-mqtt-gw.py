@@ -309,12 +309,13 @@ class MegaDDevicesSet(object):
         try:
             for megad_id, dev in self.devices.items():
                 updated_ports = await dev.fetch_ports_state()
-                for port in updated_ports:
-                    v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
-                    for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
-                        vv = v.format(**v_keyword)
-                        logger.debug('HTTP pool: Sending MQTT message to topic {} value {}'.format(t, vv))
-                        await self.mqtt_client.async_publish(t, vv, 0, True)
+                if self.mqtt_client is not None:
+                    for port in updated_ports:
+                        v_keyword = {'device_id': dev.device_id, **dev.get_ports()[port]}
+                        for t, v in self.mqtt_device[dev.device_id].port[port].mutable:
+                            vv = v.format(**v_keyword)
+                            logger.debug('HTTP pool: Sending MQTT message to topic {} value {}'.format(t, vv))
+                            await self.mqtt_client.async_publish(t, vv, 0, True)
         except Exception as e:
             logger.error('Exception on HTTP MegaD message processing. Exception detail: ' + str(e))
 
@@ -447,16 +448,13 @@ class MQTTConnector(object):
         self._mqttc.on_disconnect = self._mqtt_on_disconnect
         self._mqttc.on_message = self._mqtt_on_message
 
-    def start(self):
+    async def start(self):
         self._mqttc.connect_async(self.broker, self.port, self.keepalive)
         return self.loop.run_in_executor(None, self._mqttc.loop_start)
 
-    def stop(self):
-        def stop():
-            self._mqttc.disconnect()
-            self._mqttc.loop_stop()
-
-        return self.loop.run_in_executor(None, stop)
+    async def stop(self):
+        self._mqttc.disconnect()
+        self._mqttc.loop_stop()
 
     async def async_subscribe(self, topic, qos=MQTT_DEFAULT_QOS):
         with (await self._paho_lock):
@@ -514,11 +512,13 @@ class HTTPConnector(object):
 
     async def start(self):
         self.server_socket = await self.loop.create_server(self.server_http, self.address, self.port)
+        logger.debug("HTTP Server started.")
 
     async def stop(self):
         await self.server_http.shutdown()
         self.server_http = None
         self.server_socket = None
+        logger.debug("HTTP Server stopped.")
 
     async def handler(self, request):
         if request.rel_url.path != '/megad':
@@ -636,12 +636,12 @@ async def main_setup(loop, conf_http, conf_mqtt):
     return server_http, server_mqtt
 
 
-def async_exit(server_http, server_mqtt):
-    try:
-        # TODO: server_http.stop()
-        server_mqtt.stop()
-    except Exception:
-        pass
+async def main_tear_down(server_http, server_mqtt):
+    await server_http.stop()
+    await server_mqtt.stop()
+
+
+def main_signal_exit():
     asyncio_loop.stop()
 
 
@@ -664,10 +664,20 @@ def main():
         return
 
     for signame in ('SIGINT', 'SIGTERM'):
-        asyncio_loop.add_signal_handler(getattr(signal, signame), functools.partial(async_exit, srv_http, srv_mqtt))
+        asyncio_loop.add_signal_handler(getattr(signal, signame), main_signal_exit)
 
     asyncio_loop.run_forever()
 
+    try:
+        task = asyncio_loop.create_task(main_tear_down(srv_http, srv_mqtt))
+        asyncio_loop.run_until_complete(task)
+        task.result()
+    except Exception as e:
+        asyncio_loop.close()
+        print('Error at tear down. Exception detail: ' + str(e))
+        return
+
+    logger.info("Application finished.")
 
 if __name__ == '__main__':
     main()
