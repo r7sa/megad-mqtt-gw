@@ -71,14 +71,10 @@ class MegaDHTTPDevice(object):
         self.password = cfg['password']
         self.response_mode = MegaDHTTPDevice.response_mode_by_str[cfg.get('response_mode', 'device')]
         self.device_base_url = 'http://' + self.address + '/' + self.password + '/'
-        asyncio_loop.run_until_complete(self.query_device())
         self.mega_cf_checked = False
-        if self.mega_id is not None:
-            self.device_id = 'megad_' + self.mega_id
-            self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
-        else:
-            self.device_id = None
-            self.device_name = None
+        self.mega_id = None
+        self.device_id = None
+        self.device_name = None
 
     def get_ports(self):
         return self.ports
@@ -128,8 +124,13 @@ class MegaDHTTPDevice(object):
                                            self.address + it.group(1))
 
             self.mega_id, self.mega_cf, self.ports = megaid, megacf, ports
-        except aiohttp.ClientError:
+            if self.device_id is None:
+                self.device_id = 'megad_' + self.mega_id
+            if self.device_name is None:
+                self.device_name = 'MegaD ' + self.mega_id + ' (' + self.address + ')'
+        except aiohttp.ClientError as e:
             self.mega_id, self.mega_cf, self.ports = None, None, None
+            self.device_id, self.device_name = None, None
 
     def check_config(self):
         # <input name=sip value=192.168.1.110:19780>
@@ -248,6 +249,8 @@ class MegaDMQTTDevice(object):
 
 class MegaDDevicesSet(object):
     async def _mqtt_publish_device(self, dev):
+        if self.mqtt_client is None:
+            return
         mqtt_dev = self.mqtt_device[dev.device_id]
         await dev.fetch_ports_state()
         await self.mqtt_client.async_publish(mqtt_dev.name_topic, dev.device_name, 0, True)
@@ -270,25 +273,15 @@ class MegaDDevicesSet(object):
         self.devices = {}
         self.disabled_devices = []
         for cf_dev in cf_devices:
-            try:
-                dev = MegaDHTTPDevice(cf_dev)
-                if dev.device_id is not None:
-                    self.devices[dev.device_id] = dev
-                    logger.info('Added device ' + dev.device_id)
-                else:
-                    self.disabled_devices.append(dev)
-                    logger.info('Device {} added as disabled'.format(dev.address))
-            except Exception as e:
-                logger.warning('Error at add device ' + cf_dev.get('id', '<ID UNSPECIFIED>') + ' (' +
-                                cf_dev.get('address', '<ADDRESS UNSPECIFIED>') + '). Exception details: ' + str(e))
-                logger.warning('Device {} is excluded from processing.'.format(cf_dev.get('address', '<ADDRESS UNSPECIFIED>')))
+            dev = MegaDHTTPDevice(cf_dev)
+            self.disabled_devices.append(dev)
+            logger.info('Device {} added as disabled'.format(dev.address))
 
         cf_mqtt = cfg['mqtt']
         self.mqtt_notify_topic = cf_mqtt.get('notify_topic', None)
         self.mqtt_templates = MegaDMQTTTemplates(cf_mqtt['device_name_topic'], cf_mqtt['device_port_topic'], cf_mqtt['template'])
         self.mqtt_device = defaultdict(lambda: MegaDMQTTDevice())
-        for dev_id, dev in self.devices.items():
-            self.mqtt_device[dev_id].initialize(dev, self.mqtt_templates)
+
         self.http_server = None
         self.mqtt_client = None
 
@@ -297,12 +290,13 @@ class MegaDDevicesSet(object):
         self.mqtt_client = mqtt_client
 
     async def on_http_pool(self):
-        for dev in list(self.disabled_devices):
-            await dev.query_device()
+        await asyncio.gather(*[dev.query_device() for dev in self.disabled_devices])
+
+        for dev in list(self.disabled_devices):  # make list copy to use remove inside the loop
             if dev.device_id is not None:
                 self.devices[dev.device_id] = dev
                 self.disabled_devices.remove(dev)
-                self.mqtt_device[dev.device_id].intialize(dev, self.mqtt_templates)
+                self.mqtt_device[dev.device_id].initialize(dev, self.mqtt_templates)
                 await self._mqtt_publish_device(dev)
                 logger.info('Device enabled ' + dev.device_id)
 
@@ -613,6 +607,8 @@ def async_pooling_cb(loop, interval):
 
 
 async def main_setup(loop, conf_http, conf_mqtt):
+    await devices.on_http_pool()
+
     server_http = HTTPConnector(loop, conf_http.get('address', '0.0.0.0'), conf_http.get('port', '19780'))
     server_mqtt = MQTTConnector(loop,
                        broker=conf_mqtt.get('address', '127.0.0.1'), port=conf_mqtt.get('port', MQTT_DEFAULT_PORT),
