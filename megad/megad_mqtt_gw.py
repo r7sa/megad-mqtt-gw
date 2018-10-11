@@ -6,6 +6,7 @@ import logging
 import logging.handlers
 import signal
 import sys
+
 import megad.megad
 import megad.mqtt
 
@@ -119,8 +120,12 @@ class Main:
         self.logger.info('Application finished.')
 
 
-if __name__ == '__main__':
+def main():
     try:
         Main().run()
     except Exception as e:
         print(f'{e}')
+
+
+if __name__ == '__main__':
+    main()

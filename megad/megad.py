@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-import aiohttp
-import aiohttp.web_server
-import aiohttp.web
 import asyncio
-import netifaces
+import json
 import re
 import socket
-import json
 from enum import IntEnum
+
+import aiohttp
+import aiohttp.web
+import aiohttp.web_server
+import netifaces
 
 
 class PortType(IntEnum):

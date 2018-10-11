@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
-import paho.mqtt.client as mqtt
 
+import paho.mqtt.client as mqtt
 
 ############################################################################
 #             AsyncIO connector for MQTT protocol library                  #
