@@ -2,7 +2,7 @@
 Description=Gate between MQTT and MegaD devices
 
 [Service]
-ExecStart=/usr/bin/env python /usr/bin/megad-mqtt-gw.py
+ExecStart=/usr/bin/env python3 /usr/bin/megad-mqtt-gw.py
 
 [Install]
 WantedBy=multi-user.target

@@ -17,7 +17,7 @@ setup(
         'Topic :: System :: Networking',
         'License :: OSI Approved :: Apache Software License',
     ],
-    install_requires=['aiohttp>=1.3.1', 'lxml>=3.7.3', 'paho-mqtt>=1.2'],
+    install_requires=['aiohttp>=1.3.1', 'paho-mqtt>=1.2', 'netifaces>=0.10.5'],
     scripts=['megad-mqtt-gw.py'],
     data_files=[('/etc', ['megad-mqtt-gw.conf']), ('/lib/systemd/system', ['megad-mqtt-gw.service'])]
 )
