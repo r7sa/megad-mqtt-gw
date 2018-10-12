@@ -2,7 +2,7 @@
 Description=Gate between MQTT and MegaD devices
 
 [Service]
-ExecStart=/usr/bin/env megad-mqtt-gw --config /etc/megad-mqtt-gw.homeassistant.conf
+ExecStart=/usr/bin/env megad-mqtt-gw
 
 [Install]
 WantedBy=multi-user.target

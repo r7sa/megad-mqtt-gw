@@ -103,14 +103,16 @@ class Device(object):
         if port_type == PortType.In:
             if isinstance(value, str):
                 if value.startswith('OFF'):
-                    return 0
+                    return 'OFF'
                 if value.startswith('ON'):
-                    return 1
+                    return 'ON'
                 if value.isnumeric():
                     value = int(value)
             if isinstance(value, int):
-                if value == 0 or value == 1:
-                    return value
+                if value == 0:
+                    return 'ON'
+                if value == 1:
+                    return 'OFF'
                 if value == 2:
                     return 'LONG'
             self.platform.logger.warning(f'Unknown port mode/device: {port}. Value of type {type(value)} unparsed: {value}')
@@ -136,7 +138,6 @@ class Device(object):
             return value
 
         if port_type == PortType.ADC:
-            print(f'{port}')
             return float(value)
 
         if port_type == PortType.DSen:
@@ -299,15 +300,16 @@ class Device(object):
         return None
 
     async def parse_message(self, parameters):
-        p_name = f'p{parameters.get("pt", "")}'
-        cur_port = self.ports.get(p_name, None)
+        self.platform.logger.debug(f'Message from MegaD {self.device_id} with parameters={parameters}')
+        port_id = f'p{parameters.get("pt", "")}'
+        cur_port = self.ports.get(port_id, None)
         if cur_port is not None:
             if cur_port.get('pty') == PortType.In:
-                value = self._parse_port_value(cur_port, parameters.get('m'))
+                value = self._parse_port_value(cur_port, int(parameters.get('m', 0)))
                 if value:
                     cur_port['value'] = value
                     if self.platform.on_state_changed:
-                        self.platform.on_state_changed(self.device_id, p_name, cur_port)
+                        await self.platform.on_state_changed(self.device_id, port_id, value)
                     return
         self.platform.logger.warning(f'Unknown message from MegaD with parameters={parameters}')
 
@@ -431,7 +433,7 @@ class DevicesSet(object):
 
     async def parse_message(self, address, parameters):
         self.platform.logger.debug(f'HTTP message from {address} with parameters {parameters}')
-        dev = self.devices.get(f'megad_{address}', None)
+        dev = self.devices.get(f'megad_{address.replace(".", "_")}', None)
         if dev:
             await dev.parse_message(parameters)
 
