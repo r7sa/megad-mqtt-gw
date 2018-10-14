@@ -202,7 +202,7 @@ class Platform(object):
 
     async def on_mqtt_connect(self):
         for dev_id, dev in self.devices.items():
-            await self.publish_device(dev, None)
+            await self.publish_device(dev_id, None)
 
     async def on_mqtt_message(self, topic, payload):
         try:

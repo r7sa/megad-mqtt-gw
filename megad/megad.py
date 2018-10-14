@@ -420,10 +420,10 @@ class DevicesSet(object):
             for megad_id, dev in self.devices.items():
                 if device_id is None or dev.device_id == device_id:
                     updated = await dev.pool()
-                    for up in updated:
+                    for port_id in updated:
                         if self.platform.on_state_changed:
-                            await self.platform.on_state_changed(dev.device_id, up, dev.ports[up]['value'])
-                        result.add((dev.device_id, up))
+                            await self.platform.on_state_changed(dev.device_id, port_id, dev.ports[port_id]['value'])
+                        result.add((dev.device_id, port_id))
         except Exception as e:
             self.platform.logger.exception(f'Exception on HTTP MegaD message processing. Exception type: {type(e)} message: {e}')
         return result
