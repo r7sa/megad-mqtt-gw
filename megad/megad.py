@@ -154,6 +154,8 @@ class Device(object):
             if port_mode == PortI2CMode.SCL:
                 return None
             if port_mode == PortI2CMode.SDA:
+                if port_dev == PortI2CSDADevice.HTU21D:
+                    return json.dumps({v.split(':')[0]: float(v.split(':')[1]) for v in value.split('/')})
                 if port_dev == PortI2CSDADevice.BMx280:
                     return json.dumps({v.split(':')[0]: float(v.split(':')[1])  for v in value.split('/')})
                 if port_dev == PortI2CSDADevice.MAX44009:
