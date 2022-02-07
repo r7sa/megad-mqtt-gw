@@ -1,8 +1,0 @@
-[Unit]
-Description=Gate between MQTT and MegaD devices
-
-[Service]
-ExecStart=/usr/bin/env megad-mqtt-gw
-
-[Install]
-WantedBy=multi-user.target
